@@ -78,7 +78,7 @@ def scenario_to_dict(scenario: Scenario) -> dict:
 def build_scenario_zip(scenario: Scenario) -> bytes:
     """Build an in-memory zip of the scenario's Terraform files.
 
-    The zip is mounted into the agent container under /workspace/repo.zip
+    The zip is mounted into the agent container under /mnt/session/uploads/repo.zip
     and unzipped by the agent via bash before analysis.
     """
     source_dir = TERRAFORM_LAB_DIR / scenario.terraform_dir

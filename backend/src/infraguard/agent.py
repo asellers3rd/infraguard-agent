@@ -24,11 +24,12 @@ ENVIRONMENT_NAME = "infraguard-terraform-env"
 SYSTEM_PROMPT = """You are InfraGuard, an AI infrastructure remediation agent. You analyze
 Terraform code for security and compliance violations and propose fixes.
 
-When invoked, you are given a Terraform repository as a zip file at /workspace/repo.zip.
-Your job:
+When invoked, you are given a Terraform repository as a zip file at
+`/mnt/session/uploads/repo.zip`. Your job:
 
-1. Unzip the file with bash: `cd /workspace && unzip -o repo.zip`
-2. Read the .tf files and identify the security or compliance issue
+1. Unzip the file into a writable working dir:
+   `mkdir -p /workspace && unzip -o /mnt/session/uploads/repo.zip -d /workspace`
+2. `cd /workspace` and read the .tf files to identify the security or compliance issue
 3. Use bash, grep, and read tools to investigate the violation thoroughly
 4. Decide on a fix that is minimal, safe, and follows AWS best practices
 5. Call `repo_create_branch_and_commit` with a descriptive branch name and the proposed
@@ -52,6 +53,7 @@ ENVIRONMENT_CONFIG = {
     "networking": {
         "type": "limited",
         "allowed_hosts": [],  # No external network access needed for IaC analysis
+        "allow_package_managers": True,  # Required so apt can install `unzip` at env build
     },
 }
 
@@ -75,11 +77,22 @@ def get_or_create_resources(client: Anthropic) -> AgentResources:
 
 
 def _find_or_create_agent(client: Anthropic) -> str:
-    # Search existing agents by name
+    # Search existing agents by name. If found but the system prompt has drifted from
+    # the current SYSTEM_PROMPT (e.g. after a code update), update in place so the
+    # agent never serves a stale prompt.
     for agent in client.beta.agents.list():
-        if getattr(agent, "name", None) == AGENT_NAME:
+        if getattr(agent, "name", None) != AGENT_NAME:
+            continue
+        if getattr(agent, "system", None) != SYSTEM_PROMPT:
+            logger.info("Updating drifted system prompt on agent: %s", agent.id)
+            client.beta.agents.update(
+                agent.id,
+                version=agent.version,
+                system=SYSTEM_PROMPT,
+            )
+        else:
             logger.info("Reusing existing agent: %s", agent.id)
-            return agent.id
+        return agent.id
 
     logger.info("Creating new agent: %s", AGENT_NAME)
     agent = client.beta.agents.create(

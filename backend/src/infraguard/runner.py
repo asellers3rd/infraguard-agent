@@ -108,7 +108,9 @@ class Runner:
                 {
                     "type": "file",
                     "file_id": zip_file.id,
-                    "mount_path": "/workspace/repo.zip",
+                    # API resolves this relative to /mnt/session/uploads/, so the file
+                    # lands at /mnt/session/uploads/repo.zip — referenced by the system prompt.
+                    "mount_path": "repo.zip",
                 }
             ],
             title=f"InfraGuard: {scenario.label}",
@@ -159,7 +161,8 @@ class Runner:
                             {
                                 "type": "text",
                                 "text": (
-                                    f"A Terraform repository has been mounted at /workspace/repo.zip. "
+                                    f"A Terraform repository has been mounted at "
+                                    f"/mnt/session/uploads/repo.zip. "
                                     f"Scenario: {scenario.label}. {scenario.description}. "
                                     f"Analyze the code, identify the issue, and propose a fix following "
                                     f"the workflow in your system prompt."
@@ -328,7 +331,7 @@ class Runner:
             self._emit_threadsafe(run_id, "error", "Operator rejected tool execution. Run terminated.")
             self.client.beta.sessions.events.send(
                 session_id,
-                events=[{"type": "user.interrupt", "reason": "operator_rejected"}],
+                events=[{"type": "user.interrupt"}],
             )
 
     # -- Helpers -------------------------------------------------------------
