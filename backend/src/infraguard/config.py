@@ -26,9 +26,20 @@ class Settings(BaseSettings):
         "https://asbury.resume.miyagitrades.com"
     )
 
+    # Real GitHub integration (Phase 3). When github_token is unset the runner
+    # falls back to MockToolExecutor so the demo still works offline.
+    github_token: str | None = None
+    github_owner: str = "asellers3rd"
+    github_repo: str = "infraguard-lab"
+    github_default_branch: str = "main"
+
     @property
     def anthropic_configured(self) -> bool:
         return bool(self.anthropic_api_key)
+
+    @property
+    def github_configured(self) -> bool:
+        return bool(self.github_token)
 
     @property
     def cors_origins_list(self) -> list[str]:

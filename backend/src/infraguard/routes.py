@@ -9,6 +9,7 @@ from .runner import Runner, make_run_id
 from .scenarios import get_scenario, list_scenarios, scenario_to_dict
 from .sse import sse_response
 from .store import store
+from .tools import build_executor_from_settings
 
 
 router = APIRouter()
@@ -26,20 +27,34 @@ class StartRunResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: str
     anthropic_configured: bool
+    github_configured: bool
+    executor: str
     model: str
 
 
-def get_runner() -> Runner:
-    """Lazy-construct the Runner so health/scenarios endpoints work without an API key."""
-    from anthropic import Anthropic
+_runner: Runner | None = None
 
+
+def get_runner() -> Runner:
+    """Return the singleton Runner so approval gates persist across requests."""
+    global _runner
     if not settings.anthropic_configured:
         raise HTTPException(
             status_code=503,
             detail="Anthropic API key not configured on the backend",
         )
-    client = Anthropic(api_key=settings.anthropic_api_key)
-    return Runner(client, store)
+    if _runner is None:
+        from anthropic import Anthropic
+
+        client = Anthropic(api_key=settings.anthropic_api_key)
+        _runner = Runner(client, store, executor=build_executor_from_settings())
+    return _runner
+
+
+def reset_runner() -> None:
+    """Used by tests to force re-construction."""
+    global _runner
+    _runner = None
 
 
 @router.get("/health", response_model=HealthResponse)
@@ -47,6 +62,8 @@ async def health() -> HealthResponse:
     return HealthResponse(
         status="ok",
         anthropic_configured=settings.anthropic_configured,
+        github_configured=settings.github_configured,
+        executor="github" if settings.github_configured else "mock",
         model=settings.infraguard_model,
     )
 

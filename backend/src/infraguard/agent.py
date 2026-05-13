@@ -32,8 +32,12 @@ When invoked, you are given a Terraform repository as a zip file at
 2. `cd /workspace` and read the .tf files to identify the security or compliance issue
 3. Use bash, grep, and read tools to investigate the violation thoroughly
 4. Decide on a fix that is minimal, safe, and follows AWS best practices
-5. Call `repo_create_branch_and_commit` with a descriptive branch name and the proposed
-   file changes (this is auto-approved — feel free to commit your fix to a branch)
+5. Write the fixed file(s) to disk (e.g. `/workspace/open-ssh/main.tf`),
+   then call `repo_create_branch_and_commit`. For `files_changed`, pass an array of
+   objects: `[{"path": "<repo-relative-path>", "content": "<full file content after fix>"}]`.
+   Paths are relative to the lab repo root (the scenario directory name comes first,
+   e.g. `open-ssh/main.tf`). The `content` must be the COMPLETE file body, not a diff.
+   This call is auto-approved.
 6. Call `repo_open_pull_request` with a clear title, body, and risk_level — this requires
    human approval, and the operator may approve or reject your proposal
 7. After the PR is approved and opened, call `ci_get_latest_status` to check CI results
@@ -42,6 +46,8 @@ When invoked, you are given a Terraform repository as a zip file at
 Be concise. Use bullet points. Reference specific file paths and line numbers when possible.
 Do not modify the original repo.zip file (it is read-only). Do not attempt destructive
 actions outside the custom tools provided.
+
+[Tool schema version: v2-file-content]
 """
 
 
@@ -76,19 +82,34 @@ def get_or_create_resources(client: Anthropic) -> AgentResources:
     )
 
 
+_AGENT_TOOLS = [
+    # Built-in toolset for bash, file read/write/edit, grep
+    {
+        "type": "agent_toolset_20260401",
+        "default_config": {
+            "enabled": True,
+            "permission_policy": {"type": "always_allow"},
+        },
+    },
+    *ALL_TOOL_SCHEMAS,
+]
+
+
 def _find_or_create_agent(client: Anthropic) -> str:
-    # Search existing agents by name. If found but the system prompt has drifted from
-    # the current SYSTEM_PROMPT (e.g. after a code update), update in place so the
-    # agent never serves a stale prompt.
+    # Search existing agents by name. The system prompt has a [Tool schema version: ...]
+    # marker — bumping that marker whenever ALL_TOOL_SCHEMAS changes guarantees the
+    # drift check below also re-syncs tools, so we don't need a separate tool-equality
+    # comparison against API-returned objects.
     for agent in client.beta.agents.list():
         if getattr(agent, "name", None) != AGENT_NAME:
             continue
         if getattr(agent, "system", None) != SYSTEM_PROMPT:
-            logger.info("Updating drifted system prompt on agent: %s", agent.id)
+            logger.info("Updating drifted system prompt + tools on agent: %s", agent.id)
             client.beta.agents.update(
                 agent.id,
                 version=agent.version,
                 system=SYSTEM_PROMPT,
+                tools=_AGENT_TOOLS,
             )
         else:
             logger.info("Reusing existing agent: %s", agent.id)
@@ -99,17 +120,7 @@ def _find_or_create_agent(client: Anthropic) -> str:
         name=AGENT_NAME,
         model=settings.infraguard_model,
         system=SYSTEM_PROMPT,
-        tools=[
-            # Built-in toolset for bash, file read/write/edit, grep
-            {
-                "type": "agent_toolset_20260401",
-                "default_config": {
-                    "enabled": True,
-                    "permission_policy": {"type": "always_allow"},
-                },
-            },
-            *ALL_TOOL_SCHEMAS,
-        ],
+        tools=_AGENT_TOOLS,
     )
     return agent.id
 

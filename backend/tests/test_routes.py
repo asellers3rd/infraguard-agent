@@ -15,6 +15,8 @@ def test_health_returns_status_and_config_flag():
     body = resp.json()
     assert body["status"] == "ok"
     assert "anthropic_configured" in body
+    assert "github_configured" in body
+    assert body["executor"] in ("mock", "github")
     assert "model" in body
 
 

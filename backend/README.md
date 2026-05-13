@@ -15,6 +15,31 @@ cp .env.example .env
 
 You'll need an Anthropic API key with Managed Agents access. Get one at https://console.anthropic.com/settings/keys.
 
+### Optional: real GitHub PRs
+
+By default the agent uses a mock executor — it returns realistic-looking results but
+doesn't touch GitHub. To have the agent open real pull requests, point it at a
+disposable lab repo:
+
+1. Create a public GitHub repo (e.g. `asellers3rd/infraguard-lab`) and push the
+   contents of `../terraform-lab/` to its `main` branch. This repo is a sacrificial
+   target — every demo run opens a PR against it.
+2. Generate a fine-grained personal access token at
+   https://github.com/settings/personal-access-tokens/new scoped to the lab repo with:
+   - Contents: **Read and write**
+   - Pull requests: **Read and write**
+   - Metadata: **Read** (auto-included)
+3. Add to `backend/.env`:
+   ```
+   GITHUB_TOKEN=github_pat_...
+   GITHUB_OWNER=asellers3rd
+   GITHUB_REPO=infraguard-lab
+   GITHUB_DEFAULT_BRANCH=main
+   ```
+
+`GET /health` returns `executor: "github"` once configured. Drop the token to revert
+to the mock executor — no other code changes needed.
+
 ## CLI demo
 
 Run a single scenario end-to-end against the real Anthropic API:
@@ -65,12 +90,12 @@ The backend is split into focused modules:
 
 - `agent.py` — get-or-create the agent + environment definitions (idempotent)
 - `scenarios.py` — build zips from `../terraform-lab/<scenario>/` and serve them via the Anthropic Files API
-- `tools.py` — custom tool schemas (`repo_create_branch_and_commit`, `repo_open_pull_request`, `ci_get_latest_status`) with mock executors
+- `tools.py` — custom tool schemas plus two `ToolExecutor` implementations: `MockToolExecutor` (default, no external calls) and `GithubToolExecutor` (real GitHub REST API; selected when `GITHUB_TOKEN` is set)
 - `runner.py` — session lifecycle: open SSE stream, kick off the agent, handle `requires_action`, dispatch approve/reject
 - `routes.py` + `main.py` + `sse.py` — FastAPI HTTP layer
 - `store.py` — in-memory run state (asyncio-safe)
 
-The custom tools are mock implementations — they return realistic-looking values without doing real GitHub work. This keeps demos reliable and free of external dependencies. Real GitHub integration is on the roadmap.
+The mock executor returns realistic-looking values without external dependencies, keeping demos reliable. Setting `GITHUB_TOKEN` (see Setup above) swaps in the real `GithubToolExecutor` — same Protocol, no other code changes — and the agent creates actual branches, commits, and pull requests on the configured lab repo.
 
 ## Safety model
 

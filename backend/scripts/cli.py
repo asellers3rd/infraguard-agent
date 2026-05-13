@@ -27,6 +27,7 @@ from infraguard.config import settings  # noqa: E402
 from infraguard.runner import Runner, make_run_id  # noqa: E402
 from infraguard.scenarios import get_scenario, list_scenarios  # noqa: E402
 from infraguard.store import event_to_dict, store  # noqa: E402
+from infraguard.tools import build_executor_from_settings  # noqa: E402
 
 
 # ANSI color codes for prettier event output
@@ -90,7 +91,11 @@ async def run_scenario(scenario_id: str) -> int:
     print()
 
     client = Anthropic(api_key=settings.anthropic_api_key)
-    runner = Runner(client, store)
+    executor = build_executor_from_settings()
+    print(f"  Executor: {'github' if settings.github_configured else 'mock'}")
+    if settings.github_configured:
+        print(f"  Lab repo: {settings.github_owner}/{settings.github_repo}")
+    runner = Runner(client, store, executor=executor)
     run_id = make_run_id()
 
     await store.create_run(run_id, scenario.id, scenario.label)

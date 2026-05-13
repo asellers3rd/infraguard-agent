@@ -85,11 +85,11 @@ The `terraform-lab/` directory contains intentionally misconfigured Terraform fi
 ## Roadmap
 
 - [x] Terraform lab scenarios
-- [ ] Managed Agents MVP (session streaming + file mount)
-- [ ] Custom tool layer with approval gate
-- [ ] IaC review + auto-fix loop
-- [ ] CI/CD pipeline + governance-as-code
-- [ ] Live demo UI + metrics dashboard
+- [x] Managed Agents MVP (session streaming + file mount)
+- [x] Custom tool layer with approval gate
+- [x] IaC review + auto-fix loop (real GitHub PRs)
+- [x] CI/CD pipeline + governance-as-code (terraform + trivy + infracost)
+- [x] Live demo UI + metrics dashboard
 - [ ] Drift detection against real cloud state
 
 ## License
