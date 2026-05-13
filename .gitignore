@@ -6,6 +6,9 @@
 .terraform.lock.hcl
 crash.log
 
+# Infracost CLI cache (pricing data + terraform module cache)
+.infracost/
+
 # Environment
 .env
 .env.local
