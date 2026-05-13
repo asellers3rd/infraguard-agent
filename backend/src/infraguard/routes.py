@@ -5,10 +5,11 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from .config import settings
+from .drift import DriftScanner, build_scanner_from_settings as build_drift_scanner
 from .runner import Runner, make_run_id
 from .scenarios import get_scenario, list_scenarios, scenario_to_dict
 from .sse import sse_response
-from .store import store
+from .store import drift_store, store
 from .tools import build_executor_from_settings
 
 
@@ -29,10 +30,28 @@ class HealthResponse(BaseModel):
     anthropic_configured: bool
     github_configured: bool
     executor: str
+    drift_scanner: str
+    aws_drift_enabled: bool
+    aws_region: str
     model: str
 
 
 _runner: Runner | None = None
+_drift_scanner: DriftScanner | None = None
+
+
+def get_drift_scanner() -> DriftScanner:
+    """Singleton drift scanner for on-demand scans via POST /drift/scan."""
+    global _drift_scanner
+    if _drift_scanner is None:
+        _drift_scanner = build_drift_scanner()
+    return _drift_scanner
+
+
+def reset_drift_scanner() -> None:
+    """Test hook."""
+    global _drift_scanner
+    _drift_scanner = None
 
 
 def get_runner() -> Runner:
@@ -64,6 +83,9 @@ async def health() -> HealthResponse:
         anthropic_configured=settings.anthropic_configured,
         github_configured=settings.github_configured,
         executor="github" if settings.github_configured else "mock",
+        drift_scanner=get_drift_scanner().name,
+        aws_drift_enabled=settings.aws_drift_enabled,
+        aws_region=settings.aws_region,
         model=settings.infraguard_model,
     )
 
@@ -123,3 +145,53 @@ async def reject_run(run_id: str) -> dict:
     if not ok:
         raise HTTPException(status_code=409, detail="No pending approval for this run")
     return {"status": "rejected"}
+
+
+# ---------------------------------------------------------------------------
+# Drift detection
+# ---------------------------------------------------------------------------
+
+
+@router.get("/drift")
+async def list_drift_findings() -> dict:
+    return {
+        "scanner": get_drift_scanner().name,
+        "lastScannedAt": drift_store.last_scanned_at,
+        "findings": [f.to_dict() for f in drift_store.list_findings()],
+    }
+
+
+@router.post("/drift/scan")
+async def trigger_drift_scan() -> dict:
+    scanner = get_drift_scanner()
+    fresh = await scanner.scan()
+    counts = await drift_store.apply_scan(fresh)
+    return {
+        "scanner": scanner.name,
+        "counts": counts,
+        "lastScannedAt": drift_store.last_scanned_at,
+    }
+
+
+@router.post("/drift/{finding_id}/remediate")
+async def remediate_finding(finding_id: str) -> dict:
+    finding = drift_store.get(finding_id)
+    if finding is None:
+        raise HTTPException(status_code=404, detail=f"Finding not found: {finding_id}")
+    if finding.status == "remediating" and finding.run_id:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Finding already being remediated by run {finding.run_id}",
+        )
+    scenario = get_scenario(finding.scenario_id)
+    if scenario is None:
+        raise HTTPException(
+            status_code=500, detail=f"Finding maps to unknown scenario: {finding.scenario_id}"
+        )
+
+    runner = get_runner()
+    run_id = make_run_id()
+    await store.create_run(run_id, scenario.id, scenario.label)
+    session_id = await runner.start_run(run_id, scenario)
+    await drift_store.mark_remediating(finding_id, run_id)
+    return {"run_id": run_id, "session_id": session_id, "finding_id": finding_id}

@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Literal
 
+from .drift import DriftFinding
+
 RunStatus = Literal[
     "pending", "running", "awaiting_approval", "approved", "rejected", "completed", "failed"
 ]
@@ -146,3 +148,84 @@ class RunStore:
 
 
 store = RunStore()
+
+
+class DriftStore:
+    """Async-safe in-memory store for drift findings.
+
+    Re-scans upsert by finding id (the id is deterministic from
+    scenario+resource, see drift.make_finding_id). A finding seen in a previous
+    scan but absent from the current scan is marked `resolved` rather than
+    removed, so the dashboard can show "X was fixed at <ts>" history.
+    """
+
+    def __init__(self) -> None:
+        self._findings: dict[str, DriftFinding] = {}
+        self._lock = asyncio.Lock()
+        self._last_scanned_at: str | None = None
+
+    async def apply_scan(self, fresh: list[DriftFinding]) -> dict[str, int]:
+        """Merge a fresh scan into the store. Returns counts for telemetry."""
+        async with self._lock:
+            now = datetime.now(timezone.utc).isoformat()
+            self._last_scanned_at = now
+            fresh_by_id = {f.id: f for f in fresh}
+            new_count = 0
+            updated_count = 0
+            resolved_count = 0
+
+            for fid, finding in fresh_by_id.items():
+                existing = self._findings.get(fid)
+                if existing is None:
+                    self._findings[fid] = finding
+                    new_count += 1
+                else:
+                    existing.last_seen_at = now
+                    existing.evidence = finding.evidence
+                    existing.description = finding.description
+                    # If the user had marked it remediating and we still see it,
+                    # leave the status alone — the agent may still be working.
+                    # If it was resolved and reappeared, reopen.
+                    if existing.status == "resolved":
+                        existing.status = "open"
+                        existing.run_id = None
+                    updated_count += 1
+
+            for fid, existing in self._findings.items():
+                if fid not in fresh_by_id and existing.status != "resolved":
+                    existing.status = "resolved"
+                    resolved_count += 1
+
+            return {
+                "new": new_count,
+                "updated": updated_count,
+                "resolved": resolved_count,
+                "total": len(self._findings),
+            }
+
+    async def mark_remediating(self, finding_id: str, run_id: str) -> DriftFinding | None:
+        async with self._lock:
+            finding = self._findings.get(finding_id)
+            if finding is None:
+                return None
+            finding.status = "remediating"
+            finding.run_id = run_id
+            return finding
+
+    def get(self, finding_id: str) -> DriftFinding | None:
+        return self._findings.get(finding_id)
+
+    def list_findings(self) -> list[DriftFinding]:
+        # Sorted: open first, then remediating, then resolved; within each,
+        # newest detection first so the dashboard surfaces the most recent.
+        # Stable sort lets us do this in two passes.
+        order = {"open": 0, "remediating": 1, "resolved": 2}
+        by_recency = sorted(self._findings.values(), key=lambda f: f.detected_at, reverse=True)
+        return sorted(by_recency, key=lambda f: order.get(f.status, 9))
+
+    @property
+    def last_scanned_at(self) -> str | None:
+        return self._last_scanned_at
+
+
+drift_store = DriftStore()

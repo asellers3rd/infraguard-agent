@@ -90,7 +90,7 @@ The `terraform-lab/` directory contains intentionally misconfigured Terraform fi
 - [x] IaC review + auto-fix loop (real GitHub PRs)
 - [x] CI/CD pipeline + governance-as-code (terraform + trivy + infracost)
 - [x] Live demo UI + metrics dashboard
-- [ ] Drift detection against real cloud state
+- [x] Drift detection against real cloud state (boto3 read-only scanner, surface-only)
 
 ## License
 

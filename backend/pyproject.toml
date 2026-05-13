@@ -19,6 +19,11 @@ dev = [
     "pytest>=8.3.0",
     "pytest-asyncio>=0.24.0",
     "ruff>=0.7.0",
+    "moto[ec2,rds,s3]>=5.0.0",
+    "boto3>=1.35.0",
+]
+aws = [
+    "boto3>=1.35.0",
 ]
 tools = [
     "playwright>=1.45.0",

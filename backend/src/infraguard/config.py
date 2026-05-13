@@ -33,6 +33,13 @@ class Settings(BaseSettings):
     github_repo: str = "infraguard-lab"
     github_default_branch: str = "main"
 
+    # AWS drift detection (Phase 3). Disabled by default — when off, the
+    # scanner falls back to MockDriftScanner so the dashboard still demos.
+    aws_drift_enabled: bool = False
+    aws_region: str = "us-east-1"
+    aws_drift_scan_interval_seconds: int = 300
+    aws_required_tags: str = "Environment,Owner,CostCenter"
+
     @property
     def anthropic_configured(self) -> bool:
         return bool(self.anthropic_api_key)
