@@ -349,14 +349,30 @@ class Runner:
                 "iteration_pushed",
                 f"Pushed follow-up commit to {branch} ({len(paths)} file(s))",
             )
+        elif tool_name == "repo_acknowledge_finding":
+            rule_id = result.get("rule_id", "?")
+            scenario_dir = result.get("scenario_dir", "?")
+            if result.get("already_present"):
+                msg = f"{rule_id} already acknowledged in {scenario_dir}/.trivyignore"
+            else:
+                msg = f"Acknowledged {rule_id} in {scenario_dir}/.trivyignore"
+            self._emit_threadsafe(run_id, "finding_acknowledged", msg)
         elif tool_name == "ci_get_latest_status":
             status = result.get("status", "unknown")
             duration = result.get("duration_s", "?")
             plan = result.get("plan_summary", "")
+            findings = result.get("findings") or []
             self._emit_threadsafe(run_id, "ci_running", "CI started")
             if status == "passed":
                 self._emit_threadsafe(run_id, "ci_passed", f"CI passed in {duration}s — {plan}")
                 self._emit_threadsafe(run_id, "deployed", "PR ready to merge")
+            elif status == "failed" and findings:
+                rules = ", ".join(sorted({f.get("rule_id", "?") for f in findings})[:5])
+                self._emit_threadsafe(
+                    run_id,
+                    "ci_findings",
+                    f"CI failed with {len(findings)} finding(s): {rules}",
+                )
 
     def _extract_text(self, ev: Any) -> str:
         content = getattr(ev, "content", None)

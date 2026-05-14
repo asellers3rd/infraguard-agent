@@ -41,20 +41,35 @@ When invoked, you are given a Terraform repository as a zip file at
 6. Call `repo_open_pull_request` with a clear title, body, and risk_level — this requires
    human approval, and the operator may approve or reject your proposal
 7. After the PR is approved and opened, call `ci_get_latest_status` to check CI results.
-   If CI reports failures (e.g. tfsec/Trivy flagged an additional finding, Infracost flagged
-   a policy violation), analyze the failure, fix the additional file(s) on disk, and call
-   `repo_update_branch` with the SAME branch name returned by `repo_create_branch_and_commit`.
-   Do NOT call `repo_create_branch_and_commit` again — that creates a sibling branch and a
-   duplicate PR. The existing PR will automatically pick up your follow-up commits. After
-   pushing the iteration, call `ci_get_latest_status` again to confirm the fix landed.
+   When status is `failed`, the response includes a `findings` array of structured Trivy
+   results with `rule_id`, `severity`, `file`, `line`, `scenario_dir`, and `message`.
+   Do NOT guess at rule IDs from log text — use the values in `findings` directly.
+
+   For each finding, decide:
+   - **Fix it:** the finding represents an unintended issue (e.g. SSH open to internet,
+     bucket missing block-public-access). Write the corrected file to disk and call
+     `repo_update_branch` with the SAME branch name returned by
+     `repo_create_branch_and_commit`. Do NOT call `repo_create_branch_and_commit` again —
+     that creates a sibling branch and a duplicate PR.
+   - **Acknowledge it:** the finding is correct per the scanner but the rule is too strict
+     for this workload (e.g. AVD-AWS-0107 on outbound HTTPS — many workloads must reach
+     the public internet for package mirrors, APIs, etc.). Call
+     `repo_acknowledge_finding` with the exact `rule_id` from the findings array, the
+     `scenario_dir` from the same finding, and a clear one-line `justification`. The
+     operator sees this acknowledgment in the PR diff as a `.trivyignore` change.
+
+   After each `repo_update_branch` or `repo_acknowledge_finding` call, wait a few seconds
+   for CI to start, then call `ci_get_latest_status` again to confirm the change cleared
+   the finding. Don't poll faster than once every 10 seconds — CI takes 60-180s.
 8. Briefly summarize what you did and what the operator should know. If you iterated, note
-   how many iterations it took and what CI feedback drove each one.
+   how many iterations it took, what findings drove each one, and which (if any) you
+   acknowledged rather than fixed.
 
 Be concise. Use bullet points. Reference specific file paths and line numbers when possible.
 Do not modify the original repo.zip file (it is read-only). Do not attempt destructive
 actions outside the custom tools provided.
 
-[Tool schema version: v3-iterative-fix-loop]
+[Tool schema version: v4-policy-feedback]
 """
 
 

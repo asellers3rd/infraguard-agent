@@ -13,8 +13,11 @@ Selection happens in `routes.get_runner()` based on settings.github_configured.
 from __future__ import annotations
 
 import base64
+import io
+import json
 import logging
 import secrets
+import zipfile
 from typing import Any, Protocol
 
 import httpx
@@ -153,8 +156,10 @@ CI_GET_LATEST_STATUS = {
     "type": "custom",
     "name": "ci_get_latest_status",
     "description": (
-        "Check the latest CI run status for a pull request. "
-        "Auto-approved (read-only)."
+        "Check the latest CI run status for a pull request. When CI has failed and "
+        "Trivy uploaded a SARIF artifact, the response includes a `findings` array "
+        "with structured details (rule_id, severity, file, line, message) so you can "
+        "diagnose without parsing logs. Auto-approved (read-only)."
     ),
     "input_schema": {
         "type": "object",
@@ -165,11 +170,54 @@ CI_GET_LATEST_STATUS = {
     },
 }
 
+REPO_ACKNOWLEDGE_FINDING = {
+    "type": "custom",
+    "name": "repo_acknowledge_finding",
+    "description": (
+        "Mark a Trivy finding as intentional by appending its rule ID to `.trivyignore` "
+        "in the scenario directory on an existing fix branch. Use this when the finding "
+        "is correct per the scanner but the rule is too strict for the use case "
+        "(e.g. outbound HTTPS to 0.0.0.0/0 is required for any host that calls public "
+        "APIs). Do NOT use this to hide real misconfigurations — the operator reviews "
+        "every acknowledgment in the PR diff. Auto-approved."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "branch_name": {
+                "type": "string",
+                "description": "Existing fix branch (as returned by repo_create_branch_and_commit)",
+            },
+            "scenario_dir": {
+                "type": "string",
+                "description": (
+                    "Scenario directory the .trivyignore lives in, e.g. 'open-ssh'. "
+                    "Trivy scans each scenario dir independently so the ignore file must "
+                    "be inside it."
+                ),
+            },
+            "rule_id": {
+                "type": "string",
+                "description": "Trivy rule ID exactly as returned in the findings array, e.g. 'AVD-AWS-0104'",
+            },
+            "justification": {
+                "type": "string",
+                "description": (
+                    "One-line reason this finding is intentional. Written as a comment "
+                    "above the rule ID in .trivyignore so reviewers see the rationale."
+                ),
+            },
+        },
+        "required": ["branch_name", "scenario_dir", "rule_id", "justification"],
+    },
+}
+
 ALL_TOOL_SCHEMAS = [
     REPO_CREATE_BRANCH_AND_COMMIT,
     REPO_UPDATE_BRANCH,
     REPO_OPEN_PULL_REQUEST,
     CI_GET_LATEST_STATUS,
+    REPO_ACKNOWLEDGE_FINDING,
 ]
 
 # Tools that require explicit human approval before execution.
@@ -195,6 +243,37 @@ def _file_paths(files_changed: Any) -> list[str]:
         elif isinstance(item, str):
             out.append(item)
     return out
+
+
+def _parse_sarif_zip(zip_bytes: bytes, scenario_dir: str) -> list[dict]:
+    """Extract one finding dict per SARIF result inside the artifact zip.
+
+    `scenario_dir` is parsed from the artifact name; SARIF location URIs are
+    relative to the scan-ref (the scenario dir), so we prepend it to get a
+    repo-relative path the agent can act on.
+    """
+    findings: list[dict] = []
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        for entry in zf.namelist():
+            if not entry.endswith(".sarif"):
+                continue
+            with zf.open(entry) as f:
+                data = json.load(f)
+            for run in data.get("runs", []):
+                for result in run.get("results", []):
+                    locations = result.get("locations") or [{}]
+                    phys = locations[0].get("physicalLocation", {})
+                    file_uri = phys.get("artifactLocation", {}).get("uri", "")
+                    full_path = f"{scenario_dir}/{file_uri}" if file_uri else scenario_dir
+                    findings.append({
+                        "rule_id": result.get("ruleId", ""),
+                        "severity": result.get("level", "warning"),
+                        "scenario_dir": scenario_dir,
+                        "file": full_path,
+                        "line": phys.get("region", {}).get("startLine"),
+                        "message": result.get("message", {}).get("text", ""),
+                    })
+    return findings
 
 
 # ---------------------------------------------------------------------------
@@ -241,6 +320,15 @@ class MockToolExecutor:
                     {"name": "tfsec", "conclusion": "success"},
                     {"name": "infracost", "conclusion": "success"},
                 ],
+                "findings": [],
+            }
+        if name == "repo_acknowledge_finding":
+            return {
+                "branch": inputs.get("branch_name", "fix/auto-remediate"),
+                "rule_id": inputs.get("rule_id", "AVD-UNKNOWN"),
+                "scenario_dir": inputs.get("scenario_dir", ""),
+                "trivyignore_path": f"{inputs.get('scenario_dir', '')}/.trivyignore",
+                "acknowledged": True,
             }
         raise ValueError(f"Unknown tool: {name}")
 
@@ -301,6 +389,8 @@ class GithubToolExecutor:
             return await self._open_pull_request(inputs)
         if name == "ci_get_latest_status":
             return await self._get_ci_status(inputs)
+        if name == "repo_acknowledge_finding":
+            return await self._acknowledge_finding(inputs)
         raise ValueError(f"Unknown tool: {name}")
 
     async def aclose(self) -> None:
@@ -468,11 +558,127 @@ class GithubToolExecutor:
             for r in runs
         ]
 
+        findings: list[dict] = []
+        if agg_status == "failed":
+            findings = await self._fetch_trivy_findings(head_sha)
+
         return {
             "status": agg_status,
             "duration_s": 0,
             "plan_summary": "See CI logs on the PR" if runs else "CI not yet started",
             "checks": checks,
+            "findings": findings,
+        }
+
+    async def _fetch_trivy_findings(self, head_sha: str) -> list[dict]:
+        """Best-effort fetch of structured Trivy findings for the head commit.
+
+        Looks for workflow-run artifacts named `trivy-sarif-*` (one per scenario,
+        uploaded by the lab repo's trivy.yml). Returns [] on any failure — diagnosis
+        is helpful but not required, and we'd rather degrade to the legacy
+        "CI failed, agent guesses" behavior than break the whole tool call.
+        """
+        client = self._http()
+        try:
+            resp = await client.get(
+                "/actions/runs",
+                params={"head_sha": head_sha, "per_page": 30},
+            )
+            resp.raise_for_status()
+            workflow_runs = resp.json().get("workflow_runs", [])
+            trivy_runs = [
+                r for r in workflow_runs
+                if r.get("name") == "trivy" and r.get("status") == "completed"
+            ]
+            if not trivy_runs:
+                return []
+
+            all_findings: list[dict] = []
+            for run in trivy_runs:
+                run_id = run["id"]
+                arts_resp = await client.get(f"/actions/runs/{run_id}/artifacts")
+                if arts_resp.status_code != 200:
+                    continue
+                for art in arts_resp.json().get("artifacts", []):
+                    name = art.get("name", "")
+                    if not name.startswith("trivy-sarif-"):
+                        continue
+                    scenario_dir = name[len("trivy-sarif-"):]
+                    art_id = art["id"]
+                    dl_resp = await client.get(
+                        f"/actions/artifacts/{art_id}/zip",
+                        follow_redirects=True,
+                    )
+                    if dl_resp.status_code != 200:
+                        continue
+                    all_findings.extend(
+                        _parse_sarif_zip(dl_resp.content, scenario_dir)
+                    )
+            return all_findings
+        except (httpx.HTTPError, ValueError, KeyError, zipfile.BadZipFile):
+            logger.exception("Failed to fetch trivy findings; degrading gracefully")
+            return []
+
+    async def _acknowledge_finding(self, inputs: dict) -> dict:
+        client = self._http()
+        branch_name = inputs["branch_name"]
+        scenario_dir = inputs["scenario_dir"]
+        rule_id = inputs["rule_id"]
+        justification = inputs["justification"]
+
+        resp = await client.get(f"/git/refs/heads/{branch_name}")
+        resp.raise_for_status()
+
+        path = f"{scenario_dir}/.trivyignore"
+
+        existing = await client.get(f"/contents/{path}", params={"ref": branch_name})
+        if existing.status_code == 200:
+            existing_data = existing.json()
+            existing_sha: str | None = existing_data["sha"]
+            existing_content = base64.b64decode(existing_data["content"]).decode("utf-8")
+        elif existing.status_code == 404:
+            existing_sha = None
+            existing_content = ""
+        else:
+            existing.raise_for_status()
+            existing_sha = None
+            existing_content = ""
+
+        if any(line.strip() == rule_id for line in existing_content.splitlines()):
+            return {
+                "branch": branch_name,
+                "rule_id": rule_id,
+                "scenario_dir": scenario_dir,
+                "trivyignore_path": path,
+                "acknowledged": True,
+                "already_present": True,
+            }
+
+        prefix = existing_content
+        if prefix and not prefix.endswith("\n"):
+            prefix += "\n"
+        new_content = f"{prefix}# {justification}\n{rule_id}\n"
+
+        put_body: dict[str, Any] = {
+            "message": f"chore(security): acknowledge {rule_id} in {scenario_dir}",
+            "content": base64.b64encode(new_content.encode("utf-8")).decode("ascii"),
+            "branch": branch_name,
+        }
+        if existing_sha:
+            put_body["sha"] = existing_sha
+
+        resp = await client.put(f"/contents/{path}", json=put_body)
+        resp.raise_for_status()
+        commit_sha = resp.json()["commit"]["sha"]
+
+        return {
+            "branch": branch_name,
+            "rule_id": rule_id,
+            "scenario_dir": scenario_dir,
+            "trivyignore_path": path,
+            "commit_sha": commit_sha[:8],
+            "commit_url": f"{self.repo_url}/commit/{commit_sha}",
+            "acknowledged": True,
         }
 
 

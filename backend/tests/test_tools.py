@@ -8,11 +8,15 @@ from typing import Callable
 import httpx
 import pytest
 
+import io
+import zipfile
+
 from infraguard.tools import (
     ALL_TOOL_SCHEMAS,
     APPROVAL_REQUIRED_TOOLS,
     GithubToolExecutor,
     MockToolExecutor,
+    _parse_sarif_zip,
 )
 
 
@@ -56,6 +60,15 @@ def test_repo_update_branch_schema_registered():
     schema = next(s for s in ALL_TOOL_SCHEMAS if s["name"] == "repo_update_branch")
     items = schema["input_schema"]["properties"]["files_changed"]["items"]
     assert set(items["required"]) == {"path", "content"}
+
+
+def test_repo_acknowledge_finding_schema_registered():
+    names = {s["name"] for s in ALL_TOOL_SCHEMAS}
+    assert "repo_acknowledge_finding" in names
+    schema = next(s for s in ALL_TOOL_SCHEMAS if s["name"] == "repo_acknowledge_finding")
+    required = set(schema["input_schema"]["required"])
+    assert required == {"branch_name", "scenario_dir", "rule_id", "justification"}
+    assert "repo_acknowledge_finding" not in APPROVAL_REQUIRED_TOOLS
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +127,98 @@ async def test_mock_update_branch_preserves_branch_name():
     assert result["branch"] == "fix/restrict-ssh-abc123"
     assert result["files_changed"] == ["open-ssh/main.tf"]
     assert result["iteration"] is True
+
+
+@pytest.mark.asyncio
+async def test_mock_acknowledge_finding_returns_expected_shape():
+    executor = MockToolExecutor()
+    result = await executor.execute(
+        "repo_acknowledge_finding",
+        {
+            "branch_name": "fix/restrict-ssh-abc",
+            "scenario_dir": "open-ssh",
+            "rule_id": "AVD-AWS-0107",
+            "justification": "Outbound HTTPS required for package mirrors",
+        },
+    )
+    assert result["branch"] == "fix/restrict-ssh-abc"
+    assert result["rule_id"] == "AVD-AWS-0107"
+    assert result["scenario_dir"] == "open-ssh"
+    assert result["trivyignore_path"] == "open-ssh/.trivyignore"
+    assert result["acknowledged"] is True
+
+
+# ---------------------------------------------------------------------------
+# SARIF parsing
+# ---------------------------------------------------------------------------
+
+
+def _make_sarif_zip(findings: list[dict]) -> bytes:
+    """Build a minimal Trivy-shaped SARIF zip with the given findings."""
+    sarif = {
+        "runs": [
+            {
+                "tool": {"driver": {"name": "Trivy"}},
+                "results": [
+                    {
+                        "ruleId": f["rule_id"],
+                        "level": f.get("level", "error"),
+                        "message": {"text": f.get("message", "")},
+                        "locations": [
+                            {
+                                "physicalLocation": {
+                                    "artifactLocation": {"uri": f.get("uri", "main.tf")},
+                                    "region": {"startLine": f.get("line", 1)},
+                                }
+                            }
+                        ],
+                    }
+                    for f in findings
+                ],
+            }
+        ]
+    }
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("results.sarif", json.dumps(sarif))
+    return buf.getvalue()
+
+
+def test_parse_sarif_prepends_scenario_dir_to_file_uri():
+    zip_bytes = _make_sarif_zip([
+        {"rule_id": "AVD-AWS-0107", "uri": "main.tf", "line": 60, "message": "unrestricted egress"},
+        {"rule_id": "AVD-AWS-0104", "uri": "main.tf", "line": 43, "message": "open ssh"},
+    ])
+    findings = _parse_sarif_zip(zip_bytes, "open-ssh")
+    assert len(findings) == 2
+    assert findings[0]["rule_id"] == "AVD-AWS-0107"
+    assert findings[0]["scenario_dir"] == "open-ssh"
+    # SARIF URI is relative to scan-ref; full path should be scenario-prefixed.
+    assert findings[0]["file"] == "open-ssh/main.tf"
+    assert findings[0]["line"] == 60
+    assert findings[0]["message"] == "unrestricted egress"
+    assert findings[0]["severity"] == "error"
+
+
+def test_parse_sarif_handles_missing_location():
+    """Some SARIF results don't include a location at all — should not raise."""
+    sarif = {
+        "runs": [{
+            "results": [{
+                "ruleId": "AVD-X",
+                "level": "warning",
+                "message": {"text": "no location info"},
+            }]
+        }]
+    }
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("results.sarif", json.dumps(sarif))
+    findings = _parse_sarif_zip(buf.getvalue(), "open-ssh")
+    assert len(findings) == 1
+    assert findings[0]["rule_id"] == "AVD-X"
+    assert findings[0]["file"] == "open-ssh"
+    assert findings[0]["line"] is None
 
 
 @pytest.mark.asyncio
@@ -469,6 +574,216 @@ async def test_github_ci_status_marks_failure():
     finally:
         await executor.aclose()
     assert result["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_github_ci_status_failed_includes_parsed_findings():
+    """When CI is failed, _get_ci_status should fetch + parse the trivy SARIF artifact."""
+    sarif_zip = _make_sarif_zip([
+        {"rule_id": "AVD-AWS-0107", "uri": "main.tf", "line": 60, "message": "unrestricted egress"},
+    ])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/pulls/22"):
+            return httpx.Response(200, json={"head": {"sha": "head-sha"}})
+        if path.endswith("/commits/head-sha/check-runs"):
+            return httpx.Response(200, json={"check_runs": [
+                {"name": "trivy", "status": "completed", "conclusion": "failure"},
+            ]})
+        if path.endswith("/actions/runs"):
+            return httpx.Response(200, json={"workflow_runs": [
+                {"id": 999, "name": "trivy", "status": "completed"},
+            ]})
+        if path.endswith("/actions/runs/999/artifacts"):
+            return httpx.Response(200, json={"artifacts": [
+                {"id": 7777, "name": "trivy-sarif-open-ssh", "archive_download_url": "x"},
+            ]})
+        if path.endswith("/actions/artifacts/7777/zip"):
+            return httpx.Response(200, content=sarif_zip)
+        return httpx.Response(500, json={"message": f"unhandled {path}"})
+
+    executor = _github_executor(handler)
+    try:
+        result = await executor.execute("ci_get_latest_status", {"pr_number": 22})
+    finally:
+        await executor.aclose()
+
+    assert result["status"] == "failed"
+    assert len(result["findings"]) == 1
+    f = result["findings"][0]
+    assert f["rule_id"] == "AVD-AWS-0107"
+    assert f["scenario_dir"] == "open-ssh"
+    assert f["file"] == "open-ssh/main.tf"
+    assert f["line"] == 60
+
+
+@pytest.mark.asyncio
+async def test_github_ci_status_passed_omits_findings_fetch():
+    """When CI passes, we should NOT hit /actions/runs — wasted API calls."""
+    requested_paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_paths.append(request.url.path)
+        path = request.url.path
+        if path.endswith("/pulls/33"):
+            return httpx.Response(200, json={"head": {"sha": "h"}})
+        if path.endswith("/commits/h/check-runs"):
+            return httpx.Response(200, json={"check_runs": [
+                {"name": "trivy", "status": "completed", "conclusion": "success"},
+            ]})
+        return httpx.Response(500, json={"message": f"unhandled {path}"})
+
+    executor = _github_executor(handler)
+    try:
+        result = await executor.execute("ci_get_latest_status", {"pr_number": 33})
+    finally:
+        await executor.aclose()
+    assert result["status"] == "passed"
+    assert result["findings"] == []
+    # Sanity: never touched the artifacts API.
+    assert not any("actions" in p for p in requested_paths)
+
+
+@pytest.mark.asyncio
+async def test_github_ci_status_failure_with_no_artifacts_degrades_gracefully():
+    """If the workflow hasn't uploaded a SARIF (or 404s), result still returns with findings=[]."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/pulls/44"):
+            return httpx.Response(200, json={"head": {"sha": "h2"}})
+        if path.endswith("/commits/h2/check-runs"):
+            return httpx.Response(200, json={"check_runs": [
+                {"name": "trivy", "status": "completed", "conclusion": "failure"},
+            ]})
+        if path.endswith("/actions/runs"):
+            return httpx.Response(200, json={"workflow_runs": []})
+        return httpx.Response(404)
+
+    executor = _github_executor(handler)
+    try:
+        result = await executor.execute("ci_get_latest_status", {"pr_number": 44})
+    finally:
+        await executor.aclose()
+    assert result["status"] == "failed"
+    assert result["findings"] == []
+
+
+@pytest.mark.asyncio
+async def test_github_acknowledge_finding_creates_trivyignore_when_missing():
+    seen_put: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/git/refs/heads/fix/x-abc") and request.method == "GET":
+            return httpx.Response(200, json={"object": {"sha": "tip"}})
+        if path.endswith("/contents/open-ssh/.trivyignore") and request.method == "GET":
+            return httpx.Response(404)
+        if path.endswith("/contents/open-ssh/.trivyignore") and request.method == "PUT":
+            seen_put.update(json.loads(request.content))
+            return httpx.Response(201, json={"commit": {"sha": "ack-commit-sha"}, "content": {}})
+        return httpx.Response(500, json={"message": f"unhandled {path}"})
+
+    executor = _github_executor(handler)
+    try:
+        result = await executor.execute(
+            "repo_acknowledge_finding",
+            {
+                "branch_name": "fix/x-abc",
+                "scenario_dir": "open-ssh",
+                "rule_id": "AVD-AWS-0107",
+                "justification": "Outbound HTTPS required",
+            },
+        )
+    finally:
+        await executor.aclose()
+
+    decoded = base64.b64decode(seen_put["content"]).decode("utf-8")
+    assert "AVD-AWS-0107" in decoded
+    assert "Outbound HTTPS required" in decoded
+    assert "sha" not in seen_put  # no existing blob to overwrite
+    assert result["acknowledged"] is True
+    assert result.get("already_present") is None or result["already_present"] is False
+
+
+@pytest.mark.asyncio
+async def test_github_acknowledge_finding_appends_to_existing_trivyignore():
+    seen_put: dict = {}
+    existing_content = "# Outbound HTTPS required\nAVD-AWS-0107\n"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/git/refs/heads/fix/y-def") and request.method == "GET":
+            return httpx.Response(200, json={"object": {"sha": "tip"}})
+        if path.endswith("/contents/open-ssh/.trivyignore") and request.method == "GET":
+            return httpx.Response(200, json={
+                "sha": "existing-blob",
+                "content": base64.b64encode(existing_content.encode()).decode(),
+            })
+        if path.endswith("/contents/open-ssh/.trivyignore") and request.method == "PUT":
+            seen_put.update(json.loads(request.content))
+            return httpx.Response(200, json={"commit": {"sha": "c"}, "content": {}})
+        return httpx.Response(500)
+
+    executor = _github_executor(handler)
+    try:
+        await executor.execute(
+            "repo_acknowledge_finding",
+            {
+                "branch_name": "fix/y-def",
+                "scenario_dir": "open-ssh",
+                "rule_id": "AVD-AWS-0104",
+                "justification": "Lab demo intentionally opens SSH for documentation",
+            },
+        )
+    finally:
+        await executor.aclose()
+
+    decoded = base64.b64decode(seen_put["content"]).decode("utf-8")
+    # Old rule preserved
+    assert "AVD-AWS-0107" in decoded
+    # New rule + justification appended
+    assert "AVD-AWS-0104" in decoded
+    assert "Lab demo intentionally opens SSH" in decoded
+    # PUT included the existing blob sha so GitHub treats it as an update
+    assert seen_put["sha"] == "existing-blob"
+
+
+@pytest.mark.asyncio
+async def test_github_acknowledge_finding_idempotent_when_rule_already_present():
+    """If the rule is already in .trivyignore, no commit should be made."""
+    put_called = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal put_called
+        path = request.url.path
+        if path.endswith("/git/refs/heads/fix/z-ghi") and request.method == "GET":
+            return httpx.Response(200, json={"object": {"sha": "tip"}})
+        if path.endswith("/contents/open-ssh/.trivyignore") and request.method == "GET":
+            content = base64.b64encode(b"# old\nAVD-AWS-0107\n").decode()
+            return httpx.Response(200, json={"sha": "blob", "content": content})
+        if path.endswith("/contents/open-ssh/.trivyignore") and request.method == "PUT":
+            put_called = True
+            return httpx.Response(200, json={"commit": {"sha": "c"}, "content": {}})
+        return httpx.Response(500)
+
+    executor = _github_executor(handler)
+    try:
+        result = await executor.execute(
+            "repo_acknowledge_finding",
+            {
+                "branch_name": "fix/z-ghi",
+                "scenario_dir": "open-ssh",
+                "rule_id": "AVD-AWS-0107",
+                "justification": "Re-ack should no-op",
+            },
+        )
+    finally:
+        await executor.aclose()
+    assert put_called is False
+    assert result["already_present"] is True
+    assert result["acknowledged"] is True
 
 
 @pytest.mark.asyncio
