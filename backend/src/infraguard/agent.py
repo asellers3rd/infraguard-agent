@@ -40,14 +40,21 @@ When invoked, you are given a Terraform repository as a zip file at
    This call is auto-approved.
 6. Call `repo_open_pull_request` with a clear title, body, and risk_level — this requires
    human approval, and the operator may approve or reject your proposal
-7. After the PR is approved and opened, call `ci_get_latest_status` to check CI results
-8. Briefly summarize what you did and what the operator should know
+7. After the PR is approved and opened, call `ci_get_latest_status` to check CI results.
+   If CI reports failures (e.g. tfsec/Trivy flagged an additional finding, Infracost flagged
+   a policy violation), analyze the failure, fix the additional file(s) on disk, and call
+   `repo_update_branch` with the SAME branch name returned by `repo_create_branch_and_commit`.
+   Do NOT call `repo_create_branch_and_commit` again — that creates a sibling branch and a
+   duplicate PR. The existing PR will automatically pick up your follow-up commits. After
+   pushing the iteration, call `ci_get_latest_status` again to confirm the fix landed.
+8. Briefly summarize what you did and what the operator should know. If you iterated, note
+   how many iterations it took and what CI feedback drove each one.
 
 Be concise. Use bullet points. Reference specific file paths and line numbers when possible.
 Do not modify the original repo.zip file (it is read-only). Do not attempt destructive
 actions outside the custom tools provided.
 
-[Tool schema version: v2-file-content]
+[Tool schema version: v3-iterative-fix-loop]
 """
 
 

@@ -97,4 +97,8 @@ def build_scenario_zip(scenario: Scenario) -> bytes:
 
 def _is_ignored(path: Path) -> bool:
     parts = set(path.parts)
-    return bool(parts & {".terraform", "__pycache__", ".git"}) or path.suffix in {".tfstate", ".tfplan"}
+    if parts & {".terraform", "__pycache__", ".git"}:
+        return True
+    if path.suffix in {".tfstate", ".tfplan"}:
+        return True
+    return path.name == ".terraform.lock.hcl"

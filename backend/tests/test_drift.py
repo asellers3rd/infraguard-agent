@@ -356,7 +356,12 @@ client = TestClient(app)
 
 
 @pytest.fixture(autouse=True)
-def _reset_drift_route_singleton():
+def _reset_drift_route_singleton(monkeypatch):
+    from infraguard import config as cfg
+
+    # Force mock mode so route tests stay deterministic even when .env has
+    # AWS_DRIFT_ENABLED=true with stale creds left over from live validation.
+    monkeypatch.setattr(cfg.settings, "aws_drift_enabled", False)
     reset_drift_scanner()
     yield
     reset_drift_scanner()

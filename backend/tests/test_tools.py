@@ -45,6 +45,17 @@ def test_approval_required_tools_are_subset_of_all_tools():
     all_names = {s["name"] for s in ALL_TOOL_SCHEMAS}
     assert APPROVAL_REQUIRED_TOOLS.issubset(all_names)
     assert "repo_open_pull_request" in APPROVAL_REQUIRED_TOOLS
+    # Iterative follow-up commits must NOT require approval — the agent should
+    # be able to react to CI failures without a human-in-the-loop on every push.
+    assert "repo_update_branch" not in APPROVAL_REQUIRED_TOOLS
+
+
+def test_repo_update_branch_schema_registered():
+    names = {s["name"] for s in ALL_TOOL_SCHEMAS}
+    assert "repo_update_branch" in names
+    schema = next(s for s in ALL_TOOL_SCHEMAS if s["name"] == "repo_update_branch")
+    items = schema["input_schema"]["properties"]["files_changed"]["items"]
+    assert set(items["required"]) == {"path", "content"}
 
 
 # ---------------------------------------------------------------------------
@@ -84,6 +95,25 @@ async def test_mock_create_branch_tolerates_legacy_string_paths():
         },
     )
     assert result["files_changed"] == ["main.tf"]
+
+
+@pytest.mark.asyncio
+async def test_mock_update_branch_preserves_branch_name():
+    """repo_update_branch must NOT add a suffix — the agent needs to amend the same branch."""
+    executor = MockToolExecutor()
+    result = await executor.execute(
+        "repo_update_branch",
+        {
+            "branch_name": "fix/restrict-ssh-abc123",
+            "commit_message": "Also restrict egress",
+            "files_changed": [
+                {"path": "open-ssh/main.tf", "content": "resource ..."},
+            ],
+        },
+    )
+    assert result["branch"] == "fix/restrict-ssh-abc123"
+    assert result["files_changed"] == ["open-ssh/main.tf"]
+    assert result["iteration"] is True
 
 
 @pytest.mark.asyncio
@@ -238,6 +268,89 @@ async def test_github_overwrite_existing_file_includes_sha():
     finally:
         await executor.aclose()
     assert seen_put_body["sha"] == "existing-blob-sha"
+
+
+@pytest.mark.asyncio
+async def test_github_update_branch_does_not_create_new_ref():
+    """repo_update_branch must amend the existing branch, not POST a new ref."""
+    requests: list[tuple[str, str]] = []
+    seen_put_body: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path))
+        path = request.url.path
+
+        if path.endswith("/git/refs/heads/fix/restrict-ssh-abc123") and request.method == "GET":
+            return httpx.Response(200, json={"object": {"sha": "branch-tip-sha"}})
+        if "/contents/" in path and request.method == "GET":
+            return httpx.Response(200, json={"sha": "existing-blob-sha"})
+        if "/contents/" in path and request.method == "PUT":
+            seen_put_body.update(json.loads(request.content))
+            return httpx.Response(
+                200,
+                json={"commit": {"sha": "iteration-commit-sha"}, "content": {}},
+            )
+        return httpx.Response(500, json={"message": f"unhandled {request.method} {path}"})
+
+    executor = _github_executor(handler)
+    try:
+        result = await executor.execute(
+            "repo_update_branch",
+            {
+                "branch_name": "fix/restrict-ssh-abc123",
+                "commit_message": "Restrict egress per Trivy AWS-0104",
+                "files_changed": [
+                    {"path": "open-ssh/main.tf", "content": 'resource "x" {}\n'},
+                ],
+            },
+        )
+    finally:
+        await executor.aclose()
+
+    # No POST to /git/refs — we must NOT create a sibling branch.
+    assert not any(method == "POST" and path.endswith("/git/refs") for method, path in requests)
+    # Branch name preserved exactly (no suffix added).
+    assert result["branch"] == "fix/restrict-ssh-abc123"
+    # PUT carried the existing blob sha so GitHub treats it as an update, not a create.
+    assert seen_put_body["sha"] == "existing-blob-sha"
+    assert seen_put_body["branch"] == "fix/restrict-ssh-abc123"
+    assert result["iteration"] is True
+    assert result["files_changed"] == ["open-ssh/main.tf"]
+
+
+@pytest.mark.asyncio
+async def test_github_update_branch_creates_new_file_when_missing():
+    """If a follow-up commit adds a file that didn't exist on the branch, no sha is needed."""
+    seen_put_body: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/git/refs/heads/fix/x-deadbe") and request.method == "GET":
+            return httpx.Response(200, json={"object": {"sha": "tip"}})
+        if "/contents/" in path and request.method == "GET":
+            return httpx.Response(404, json={"message": "Not Found"})
+        if "/contents/" in path and request.method == "PUT":
+            seen_put_body.update(json.loads(request.content))
+            return httpx.Response(
+                201,
+                json={"commit": {"sha": "new-commit"}, "content": {}},
+            )
+        return httpx.Response(500)
+
+    executor = _github_executor(handler)
+    try:
+        await executor.execute(
+            "repo_update_branch",
+            {
+                "branch_name": "fix/x-deadbe",
+                "commit_message": "Add policy file",
+                "files_changed": [{"path": "policies/egress.rego", "content": "package x"}],
+            },
+        )
+    finally:
+        await executor.aclose()
+    # No sha key when the file didn't exist on the branch.
+    assert "sha" not in seen_put_body
 
 
 @pytest.mark.asyncio

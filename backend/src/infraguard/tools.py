@@ -73,6 +73,56 @@ REPO_CREATE_BRANCH_AND_COMMIT = {
     },
 }
 
+REPO_UPDATE_BRANCH = {
+    "type": "custom",
+    "name": "repo_update_branch",
+    "description": (
+        "Push follow-up commits to an EXISTING branch you created earlier with "
+        "repo_create_branch_and_commit. Use this when CI reports failures on the "
+        "open PR — it amends the existing branch (and the existing PR auto-picks "
+        "up the new commits) rather than creating a sibling branch and a duplicate "
+        "PR. Auto-approved (low risk — does not affect production)."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "branch_name": {
+                "type": "string",
+                "description": (
+                    "Exact name of the existing branch as returned by "
+                    "repo_create_branch_and_commit (including its random suffix)."
+                ),
+            },
+            "commit_message": {
+                "type": "string",
+                "description": "Conventional commit message describing the follow-up fix",
+            },
+            "files_changed": {
+                "type": "array",
+                "description": (
+                    "Every file the follow-up commit touches. Provide the FULL file "
+                    "content after the fix is applied — not a diff."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Repo-relative path",
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "Full file content after the follow-up fix",
+                        },
+                    },
+                    "required": ["path", "content"],
+                },
+            },
+        },
+        "required": ["branch_name", "commit_message", "files_changed"],
+    },
+}
+
 REPO_OPEN_PULL_REQUEST = {
     "type": "custom",
     "name": "repo_open_pull_request",
@@ -117,6 +167,7 @@ CI_GET_LATEST_STATUS = {
 
 ALL_TOOL_SCHEMAS = [
     REPO_CREATE_BRANCH_AND_COMMIT,
+    REPO_UPDATE_BRANCH,
     REPO_OPEN_PULL_REQUEST,
     CI_GET_LATEST_STATUS,
 ]
@@ -162,6 +213,14 @@ class MockToolExecutor:
                 "commit_sha": secrets.token_hex(4),
                 "files_changed": _file_paths(inputs.get("files_changed")),
                 "commit_url": f"{self.REPO_URL}/commit/{secrets.token_hex(4)}",
+            }
+        if name == "repo_update_branch":
+            return {
+                "branch": inputs.get("branch_name", "fix/auto-remediate"),
+                "commit_sha": secrets.token_hex(4),
+                "files_changed": _file_paths(inputs.get("files_changed")),
+                "commit_url": f"{self.REPO_URL}/commit/{secrets.token_hex(4)}",
+                "iteration": True,
             }
         if name == "repo_open_pull_request":
             pr_number = secrets.randbelow(60) + 40
@@ -236,6 +295,8 @@ class GithubToolExecutor:
     async def execute(self, name: str, inputs: dict) -> dict:
         if name == "repo_create_branch_and_commit":
             return await self._create_branch_and_commit(inputs)
+        if name == "repo_update_branch":
+            return await self._update_branch(inputs)
         if name == "repo_open_pull_request":
             return await self._open_pull_request(inputs)
         if name == "ci_get_latest_status":
@@ -302,6 +363,57 @@ class GithubToolExecutor:
             "commit_sha": last_commit_sha[:8],
             "files_changed": committed_paths,
             "commit_url": f"{self.repo_url}/commit/{last_commit_sha}",
+        }
+
+    async def _update_branch(self, inputs: dict) -> dict:
+        """Push follow-up commits to an existing branch without creating a new ref.
+
+        Confirms the branch exists, then PUTs each file's new content (passing the
+        existing blob sha when the file is already present, so GitHub treats it as
+        an update rather than a create).
+        """
+        client = self._http()
+        branch_name = inputs["branch_name"]
+        commit_message = inputs["commit_message"]
+        files = inputs.get("files_changed") or []
+
+        # Confirm the branch exists — surfaces a clean error if the agent passed a
+        # branch name that was never created. raise_for_status() will 404 here.
+        resp = await client.get(f"/git/refs/heads/{branch_name}")
+        resp.raise_for_status()
+
+        last_commit_sha = resp.json()["object"]["sha"]
+        committed_paths: list[str] = []
+        for entry in files:
+            if not isinstance(entry, dict):
+                continue
+            path = entry.get("path")
+            content = entry.get("content")
+            if not path or content is None:
+                continue
+
+            existing = await client.get(f"/contents/{path}", params={"ref": branch_name})
+            put_body: dict[str, Any] = {
+                "message": commit_message,
+                "content": base64.b64encode(content.encode("utf-8")).decode("ascii"),
+                "branch": branch_name,
+            }
+            if existing.status_code == 200:
+                put_body["sha"] = existing.json()["sha"]
+            elif existing.status_code != 404:
+                existing.raise_for_status()
+
+            resp = await client.put(f"/contents/{path}", json=put_body)
+            resp.raise_for_status()
+            last_commit_sha = resp.json()["commit"]["sha"]
+            committed_paths.append(path)
+
+        return {
+            "branch": branch_name,
+            "commit_sha": last_commit_sha[:8],
+            "files_changed": committed_paths,
+            "commit_url": f"{self.repo_url}/commit/{last_commit_sha}",
+            "iteration": True,
         }
 
     async def _open_pull_request(self, inputs: dict) -> dict:

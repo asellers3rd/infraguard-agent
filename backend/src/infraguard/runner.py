@@ -341,6 +341,14 @@ class Runner:
             pr_url = result.get("pr_url", "")
             pr_number = result.get("pr_number", "")
             self._emit_threadsafe(run_id, "pr_opened", f"PR #{pr_number} opened: {pr_url}")
+        elif tool_name == "repo_update_branch":
+            branch = result.get("branch", "?")
+            paths = result.get("files_changed") or []
+            self._emit_threadsafe(
+                run_id,
+                "iteration_pushed",
+                f"Pushed follow-up commit to {branch} ({len(paths)} file(s))",
+            )
         elif tool_name == "ci_get_latest_status":
             status = result.get("status", "unknown")
             duration = result.get("duration_s", "?")
