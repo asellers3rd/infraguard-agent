@@ -17,9 +17,13 @@ provider "aws" {
   region = var.aws_region
 }
 
+data "aws_ssm_parameter" "al2023_ami" {
+  name = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
+}
+
 # VIOLATION: No required tags
 resource "aws_instance" "app_server" {
-  ami           = "ami-0c55b159cbfafe1f0"
+  ami           = data.aws_ssm_parameter.al2023_ami.value
   instance_type = "t3.medium"
 
   root_block_device {

@@ -3,11 +3,17 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from dotenv import load_dotenv
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 TERRAFORM_LAB_DIR = REPO_ROOT / "terraform-lab"
+
+# Populate os.environ from .env so libraries that read env vars directly
+# (boto3, anthropic, etc.) see the same values as pydantic Settings. Existing
+# env vars take precedence — .env never overrides what the shell exported.
+load_dotenv(REPO_ROOT / "backend" / ".env")
 
 
 class Settings(BaseSettings):

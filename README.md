@@ -91,6 +91,49 @@ The `terraform-lab/` directory contains intentionally misconfigured Terraform fi
 - [x] CI/CD pipeline + governance-as-code (terraform + trivy + infracost)
 - [x] Live demo UI + metrics dashboard
 - [x] Drift detection against real cloud state (boto3 read-only scanner, surface-only)
+- [x] **End-to-end validation against a real AWS account** (May 2026 — see below)
+- [ ] Iterative fix loop: agent pushes follow-up commits to the same PR branch
+- [ ] Policy-as-feedback: CI failures feed structured signals back into the agent
+
+## Validation
+
+The full loop was exercised against a real AWS sandbox in May 2026 — not just unit tests against
+moto stubs. Setup walkthrough lives in [`docs/aws-setup.md`](docs/aws-setup.md); the apply
+helper is at [`terraform-lab/apply-lab.sh`](terraform-lab/apply-lab.sh).
+
+**What ran end-to-end:**
+
+1. Two IAM users provisioned with least-privilege boundaries — `infraguard-tf` (PowerUserAccess
+   for terraform) and `infraguard-scanner` (a 9-action read-only inline policy for boto3).
+2. Three lab scenarios applied via Terraform (`open-ssh`, `missing-tags`, `public-s3`).
+3. The boto3 scanner detected **9 live findings** in a single scan — six from lab resources,
+   three pre-existing collateral findings on unrelated S3 buckets.
+4. Clicking **Remediate** on the open-ssh finding kicked off a Managed Agent session that
+   diagnosed the misconfiguration, drafted a Terraform change, paused at the approval gate,
+   opened a real PR on the lab repo, and watched CI run (terraform + trivy + infracost).
+
+**What live validation surfaced that mocks couldn't:**
+
+- **Stale hardcoded AMI:** `missing-tags/main.tf` had `ami-0c55b159cbfafe1f0` (a 2018 us-west-2
+  AMI that doesn't exist in us-east-1 today). Replaced with an SSM-parameter data source for
+  Amazon Linux 2023 so the scenario stays valid as AMIs rotate.
+- **No default VPC on modern AWS accounts:** new accounts since late 2022 don't auto-create
+  one. `aws ec2 create-default-vpc` once per account.
+- **Post-2023 S3 hardening is three layers deep:** account-level Block Public Access +
+  bucket-level BPA + `BucketOwnerEnforced` ownership all default to ON. The public-ACL
+  violation in the original `public-s3` scenario couldn't even be created. Reduced the
+  scenario to the "missing bucket-level PAB" violation, which the scanner detects via
+  `NoSuchPublicAccessBlockConfiguration` and the agent fixes with a real IaC resource —
+  closer to how this is remediated in practice anyway.
+- **pydantic-settings doesn't propagate to `os.environ`:** boto3 reads creds from the
+  process environment, not from the Settings object. `.env` values for `AWS_ACCESS_KEY_ID`
+  were silently invisible until `load_dotenv()` was called explicitly in `config.py`.
+- **Compounding rough edges in the agent loop:** Trivy flagged a different CRITICAL on the
+  agent's first fix (`AWS-0104` — unrestricted egress). The agent tried to push a follow-up
+  commit, but `repo_create_branch_and_commit` always branches from base, so the retry
+  landed on a sibling branch → opened a sibling PR instead of amending the original. This
+  validates both Phase 4 work items as real, demonstrable rough edges rather than
+  speculative ones. They're now the top priorities.
 
 ## License
 
